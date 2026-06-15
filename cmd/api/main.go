@@ -1,19 +1,34 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 )
 
+type jsonResponse map[string]string
+
+func writeJSON(w http.ResponseWriter, status int, data jsonResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+
+	err := json.NewEncoder(w).Encode(data)
+	if err != nil {
+		log.Println("Failed to write JSON response:", err)
+	}
+}
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
+	writeJSON(w, http.StatusOK, jsonResponse{
+		"status": "ok",
+	})
 }
 
 func rootHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ReliabilityOps API is running"))
+	writeJSON(w, http.StatusOK, jsonResponse{
+		"message": "ReliabilityOps API is running",
+		"status":  "ok",
+	})
 }
 
 func main() {
