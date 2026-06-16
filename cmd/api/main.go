@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -228,7 +229,11 @@ func main() {
 	mux.HandleFunc("/tasks", tasksHandler)
 	mux.HandleFunc("/tasks/", taskByIDHandler)
 
-	port := "8080"
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
 	addr := ":" + port
 
 	fmt.Println("Starting ReliabilityOps API on port", port)
