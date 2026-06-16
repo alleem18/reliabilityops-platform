@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -8,8 +9,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type jsonResponse map[string]string
@@ -28,11 +32,111 @@ type taskRequest struct {
 	Status      string `json:"status"`
 }
 
+var db *sql.DB
+
 var (
-	tasks  = make(map[int]Task)
-	nextID = 1
-	mu     sync.Mutex
+	httpRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "reliabilityops_http_requests_total",
+			Help: "Total number of HTTP requests processed by the API.",
+		},
+		[]string{"method", "path", "status"},
+	)
+
+	httpRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "reliabilityops_http_request_duration_seconds",
+			Help:    "HTTP request duration in seconds.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "path"},
+	)
+
+	taskOperationsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "reliabilityops_task_operations_total",
+			Help: "Total number of task operations.",
+		},
+		[]string{"operation", "result"},
+	)
+
+	incidentSimulationsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "reliabilityops_incident_simulations_total",
+			Help: "Total number of incident simulations triggered.",
+		},
+		[]string{"type"},
+	)
 )
+
+func registerMetrics() {
+	prometheus.MustRegister(httpRequestsTotal)
+	prometheus.MustRegister(httpRequestDuration)
+	prometheus.MustRegister(taskOperationsTotal)
+	prometheus.MustRegister(incidentSimulationsTotal)
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.statusCode = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func routePattern(path string) string {
+	if strings.HasPrefix(path, "/tasks/") {
+		return "/tasks/{id}"
+	}
+
+	return path
+
+}
+
+func metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		recorder := &statusRecorder{
+			ResponseWriter: w,
+			statusCode:     http.StatusOK,
+		}
+
+		next.ServeHTTP(recorder, r)
+
+		path := routePattern(r.URL.Path)
+		httpRequestsTotal.WithLabelValues(
+			r.Method,
+			path,
+			strconv.Itoa(recorder.statusCode),
+		).Inc()
+
+		httpRequestDuration.WithLabelValues(
+			r.Method,
+			path,
+		).Observe(time.Since(start).Seconds())
+	})
+}
+
+func connectDB() (*sql.DB, error) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = "postgres://reliabilityops:reliabilityops@localhost:5432/reliabilityops?sslmode=disable"
+	}
+
+	conn, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := conn.Ping(); err != nil {
+		return nil, err
+	}
+
+	return conn, nil
+}
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -50,6 +154,22 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func readyHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		writeJSON(w, http.StatusServiceUnavailable, jsonResponse{
+			"status": "not ready",
+			"error":  "database not initialized",
+		})
+		return
+	}
+
+	if err := db.Ping(); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, jsonResponse{
+			"status": "not ready",
+			"error":  "database unavailable",
+		})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, jsonResponse{
 		"status": "ready",
 	})
@@ -76,14 +196,34 @@ func tasksHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func listTasks(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
+	rows, err := db.Query(`
+		SELECT id, title, description, status, created_at
+		FROM tasks
+		ORDER BY id ASC
+	`)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, jsonResponse{
+			"error": "failed to list tasks",
+		})
+		return
+	}
+	defer rows.Close()
 
-	taskList := make([]Task, 0, len(tasks))
-	for _, task := range tasks {
+	taskList := []Task{}
+
+	for rows.Next() {
+		var task Task
+		err := rows.Scan(&task.ID, &task.Title, &task.Description, &task.Status, &task.CreatedAt)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, jsonResponse{
+				"error": "failed to read task",
+			})
+			return
+		}
+
 		taskList = append(taskList, task)
 	}
-
+	taskOperationsTotal.WithLabelValues("list", "success").Inc()
 	writeJSON(w, http.StatusOK, taskList)
 }
 
@@ -92,6 +232,7 @@ func createTask(w http.ResponseWriter, r *http.Request) {
 
 	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
+
 		writeJSON(w, http.StatusBadRequest, jsonResponse{
 			"error": "invalid JSON body",
 		})
@@ -111,20 +252,30 @@ func createTask(w http.ResponseWriter, r *http.Request) {
 		status = "open"
 	}
 
-	mu.Lock()
-	task := Task{
-		ID:          nextID,
-		Title:       req.Title,
-		Description: req.Description,
-		Status:      status,
-		CreatedAt:   time.Now(),
-	}
-	tasks[nextID] = task
-	nextID++
-	mu.Unlock()
+	var task Task
 
+	err = db.QueryRow(`
+		INSERT INTO tasks (title, description, status)
+		VALUES ($1, $2, $3)
+		RETURNING id, title, description, status, created_at
+	`, req.Title, req.Description, status).Scan(
+		&task.ID,
+		&task.Title,
+		&task.Description,
+		&task.Status,
+		&task.CreatedAt,
+	)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, jsonResponse{
+			"error": "failed to create task",
+		})
+		taskOperationsTotal.WithLabelValues("create", "error").Inc()
+		return
+	}
+	taskOperationsTotal.WithLabelValues("create", "error").Inc()
 	writeJSON(w, http.StatusCreated, task)
 }
+
 func taskByIDHandler(w http.ResponseWriter, r *http.Request) {
 	idText := strings.TrimPrefix(r.URL.Path, "/tasks/")
 	id, err := strconv.Atoi(idText)
@@ -149,18 +300,103 @@ func taskByIDHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func getTask(w http.ResponseWriter, r *http.Request, id int) {
-	mu.Lock()
-	defer mu.Unlock()
+func simulateErrorHandler(w http.ResponseWriter, r *http.Request) {
+	incidentSimulationsTotal.WithLabelValues("error").Inc()
 
-	task, exists := tasks[id]
-	if !exists {
+	writeJSON(w, http.StatusInternalServerError, jsonResponse{
+		"status": "simulated_error",
+		"error":  "intentional 500 error for incident testing",
+	})
+}
+
+func simulateLatencyHandler(w http.ResponseWriter, r *http.Request) {
+	msText := r.URL.Query().Get("ms")
+	if msText == "" {
+		msText = "1000"
+	}
+
+	ms, err := strconv.Atoi(msText)
+	if err != nil || ms < 0 {
+		writeJSON(w, http.StatusBadRequest, jsonResponse{
+			"error": "ms must be a positive number",
+		})
+		return
+	}
+
+	if ms > 10000 {
+		ms = 10000
+	}
+
+	incidentSimulationsTotal.WithLabelValues("latency").Inc()
+
+	time.Sleep(time.Duration(ms) * time.Millisecond)
+
+	writeJSON(w, http.StatusOK, jsonResponse{
+		"status": "simulated_latency",
+		"delay":  fmt.Sprintf("%dms", ms),
+	})
+}
+
+func simulateCPUHandler(w http.ResponseWriter, r *http.Request) {
+	secondsText := r.URL.Query().Get("seconds")
+	if secondsText == "" {
+		secondsText = "5"
+	}
+
+	seconds, err := strconv.Atoi(secondsText)
+	if err != nil || seconds < 0 {
+		writeJSON(w, http.StatusBadRequest, jsonResponse{
+			"error": "seconds must be a positive number",
+		})
+		return
+	}
+
+	if seconds > 20 {
+		seconds = 20
+	}
+
+	incidentSimulationsTotal.WithLabelValues("cpu").Inc()
+
+	deadline := time.Now().Add(time.Duration(seconds) * time.Second)
+	for time.Now().Before(deadline) {
+		_ = 42 * 42
+	}
+
+	writeJSON(w, http.StatusOK, jsonResponse{
+		"status":   "simulated_cpu_load",
+		"duration": fmt.Sprintf("%ds", seconds),
+	})
+}
+
+func getTask(w http.ResponseWriter, r *http.Request, id int) {
+	var task Task
+
+	err := db.QueryRow(`
+		SELECT id, title, description, status, created_at
+		FROM tasks
+		WHERE id = $1
+	`, id).Scan(
+		&task.ID,
+		&task.Title,
+		&task.Description,
+		&task.Status,
+		&task.CreatedAt,
+	)
+
+	if err == sql.ErrNoRows {
 		writeJSON(w, http.StatusNotFound, jsonResponse{
 			"error": "task not found",
 		})
 		return
 	}
 
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, jsonResponse{
+			"error": "failed to get task",
+		})
+		return
+	}
+	taskOperationsTotal.WithLabelValues("get", "success").Inc()
 	writeJSON(w, http.StatusOK, task)
 }
 
@@ -175,52 +411,109 @@ func updateTask(w http.ResponseWriter, r *http.Request, id int) {
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	var existing Task
 
-	task, exists := tasks[id]
-	if !exists {
+	err = db.QueryRow(`
+		SELECT id, title, description, status, created_at
+		FROM tasks
+		WHERE id = $1
+	`, id).Scan(
+		&existing.ID,
+		&existing.Title,
+		&existing.Description,
+		&existing.Status,
+		&existing.CreatedAt,
+	)
+
+	if err == sql.ErrNoRows {
 		writeJSON(w, http.StatusNotFound, jsonResponse{
 			"error": "task not found",
+		})
+		return
+	}
+
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, jsonResponse{
+			"error": "failed to get task",
 		})
 		return
 	}
 
 	if strings.TrimSpace(req.Title) != "" {
-		task.Title = strings.TrimSpace(req.Title)
+		existing.Title = strings.TrimSpace(req.Title)
 	}
 	if strings.TrimSpace(req.Description) != "" {
-		task.Description = req.Description
+		existing.Description = req.Description
 	}
 	if strings.TrimSpace(req.Status) != "" {
-		task.Status = strings.TrimSpace(req.Status)
+		existing.Status = strings.TrimSpace(req.Status)
 	}
 
-	tasks[id] = task
+	err = db.QueryRow(`
+		UPDATE tasks
+		SET title = $1, description = $2, status = $3
+		WHERE id = $4
+		RETURNING id, title, description, status, created_at
+	`, existing.Title, existing.Description, existing.Status, id).Scan(
+		&existing.ID,
+		&existing.Title,
+		&existing.Description,
+		&existing.Status,
+		&existing.CreatedAt,
+	)
 
-	writeJSON(w, http.StatusOK, task)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, jsonResponse{
+			"error": "failed to update task",
+		})
+		return
+	}
+	taskOperationsTotal.WithLabelValues("update", "success").Inc()
+	writeJSON(w, http.StatusOK, existing)
 }
 
 func deleteTask(w http.ResponseWriter, r *http.Request, id int) {
-	mu.Lock()
-	defer mu.Unlock()
+	result, err := db.Exec(`
+		DELETE FROM tasks
+		WHERE id = $1
+	`, id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, jsonResponse{
+			"error": "failed to delete task",
+		})
+		return
+	}
 
-	_, exists := tasks[id]
-	if !exists {
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, jsonResponse{
+			"error": "failed to confirm deletion",
+		})
+		return
+	}
+
+	if rowsAffected == 0 {
 		writeJSON(w, http.StatusNotFound, jsonResponse{
 			"error": "task not found",
 		})
 		return
 	}
-
-	delete(tasks, id)
-
+	taskOperationsTotal.WithLabelValues("delete", "success").Inc()
 	writeJSON(w, http.StatusOK, jsonResponse{
 		"status": "deleted",
 	})
 }
 
 func main() {
+	var err error
+	db, err = connectDB()
+	if err != nil {
+		log.Fatal("failed to connect to database:", err)
+	}
+	defer db.Close()
+
+	registerMetrics()
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", rootHandler)
@@ -228,6 +521,10 @@ func main() {
 	mux.HandleFunc("/ready", readyHandler)
 	mux.HandleFunc("/tasks", tasksHandler)
 	mux.HandleFunc("/tasks/", taskByIDHandler)
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/simulate/error", simulateErrorHandler)
+	mux.HandleFunc("/simulate/latency", simulateLatencyHandler)
+	mux.HandleFunc("/simulate/cpu", simulateCPUHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -238,8 +535,7 @@ func main() {
 
 	fmt.Println("Starting ReliabilityOps API on port", port)
 
-	err := http.ListenAndServe(addr, mux)
-	if err != nil {
-		log.Fatal(err)
-	}
+	handler := metricsMiddleware(mux)
+
+	err = http.ListenAndServe(addr, handler)
 }
