@@ -1,0 +1,32 @@
+groups:
+  - name: reliabilityops-api-alerts
+    rules:
+      - alert: ReliabilityOpsAPIDown
+        expr: up{job="reliabilityops-api"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          service: reliabilityops-api
+        annotations:
+          summary: "ReliabilityOps API is down"
+          description: "Prometheus cannot scrape the ReliabilityOps API metrics endpoint."
+
+      - alert: ReliabilityOpsHighErrorRate
+        expr: sum(rate(reliabilityops_http_requests_total{status=~"5.."}[1m])) > 0.1
+        for: 30s
+        labels:
+          severity: warning
+          service: reliabilityops-api
+        annotations:
+          summary: "High API error rate detected"
+          description: "The API is returning elevated 5xx responses."
+
+      - alert: ReliabilityOpsHighLatencyP95
+        expr: histogram_quantile(0.95, sum by (le, path) (rate(reliabilityops_http_request_duration_seconds_bucket[1m]))) > 1
+        for: 30s
+        labels:
+          severity: warning
+          service: reliabilityops-api
+        annotations:
+          summary: "High API latency detected"
+          description: "The API p95 latency is above 1 second."

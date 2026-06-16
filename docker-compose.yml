@@ -38,8 +38,18 @@ services:
       - "9090:9090"
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml
     depends_on:
       - api
+      - alertmanager
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: reliabilityops-alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./observability/alertmanager.yml:/etc/alertmanager/alertmanager.yml
 
   grafana:
     image: grafana/grafana:11.1.0
@@ -56,6 +66,9 @@ services:
     depends_on:
       - prometheus
 
+
+
 volumes:
   reliabilityops_pgdata:
   reliabilityops_grafana_data:
+  
