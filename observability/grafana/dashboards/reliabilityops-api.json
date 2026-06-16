@@ -1,0 +1,59 @@
+{
+  "id": null,
+  "uid": "reliabilityops-api",
+  "title": "ReliabilityOps API",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Total HTTP Requests",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(reliabilityops_http_requests_total)",
+          "legendFormat": "requests"
+        }
+      ],
+      "datasource": { "type": "prometheus", "uid": "Prometheus" }
+    },
+    {
+      "type": "timeseries",
+      "title": "HTTP Requests by Path",
+      "gridPos": { "x": 6, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (path) (rate(reliabilityops_http_requests_total[1m]))",
+          "legendFormat": "{{path}}"
+        }
+      ],
+      "datasource": { "type": "prometheus", "uid": "Prometheus" }
+    },
+    {
+      "type": "timeseries",
+      "title": "Request Duration p95",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, path) (rate(reliabilityops_http_request_duration_seconds_bucket[1m])))",
+          "legendFormat": "{{path}}"
+        }
+      ],
+      "datasource": { "type": "prometheus", "uid": "Prometheus" }
+    },
+    {
+      "type": "timeseries",
+      "title": "Task Operations",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (operation, result) (rate(reliabilityops_task_operations_total[1m]))",
+          "legendFormat": "{{operation}} {{result}}"
+        }
+      ],
+      "datasource": { "type": "prometheus", "uid": "Prometheus" }
+    }
+  ]
+}
