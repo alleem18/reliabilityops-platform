@@ -24,6 +24,12 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func readyHandler(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, jsonResponse{
+		"status": "ready",
+	})
+}
+
 func rootHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, jsonResponse{
 		"message": "ReliabilityOps API is running",
